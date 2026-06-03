@@ -273,7 +273,6 @@ static void sfs_super_apply(struct sfs_fs_info *info, struct sfs_super_block_dis
 	info->file_size_sectors = le32_to_cpu(ds->sectors_per_file);
 }
 
-/* Create fresh superblocks (primary + backup) for a new filesystem. */
 static int sfs_create_super(struct super_block *sb, struct sfs_fs_info *info)
 {
 	struct buffer_head *bh, *bh2;
@@ -306,11 +305,6 @@ static int sfs_create_super(struct super_block *sb, struct sfs_fs_info *info)
 	return 0;
 }
 
-/*
- * Load an existing filesystem. Validate the primary superblock; if it is
- * corrupted, fall back to the backup copy and repair the primary from it.
- * If both copies are invalid, fail instead of silently recreating the fs.
- */
 static int sfs_load_super(struct super_block *sb, struct sfs_fs_info *info, int silent)
 {
 	struct buffer_head *bh, *bh2;
@@ -341,7 +335,6 @@ static int sfs_load_super(struct super_block *sb, struct sfs_fs_info *info, int 
 	}
 
 	sfs_super_apply(info, ds2);
-	/* repair the primary superblock from the valid backup */
 	memcpy(ds, ds2, SFS_BLOCK_SIZE);
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
