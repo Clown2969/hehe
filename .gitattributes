@@ -1,6 +1,0 @@
-# Эти файлы исполняются в Linux/контейнере — всегда LF, иначе bash ломается.
-*.sh        text eol=lf
-Dockerfile  text eol=lf
-Makefile    text eol=lf
-*.c         text eol=lf
-*.h         text eol=lf
