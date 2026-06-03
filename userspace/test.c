@@ -48,7 +48,8 @@ int main(int argc, char **argv) {
 		struct sfs_meta_info buf[1024];
 		struct sfs_meta_array arr = { .capacity = 1024, .buffer_ptr = (uintptr_t)buf };
 		if (ioctl(fd, SFS_IOC_LIST_METADATA, &arr) == 0) {
-			for (int i = 0; i < arr.found_count && i < 10; i++)
+			uint64_t n = arr.found_count < arr.capacity ? arr.found_count : arr.capacity;
+			for (uint64_t i = 0; i < n; i++)
 				printf("%s: sector %llu, hash %08x\n", buf[i].filename, (unsigned long long)buf[i].start_sector, buf[i].content_hash);
 		}
 	} else if (!strcmp(cmd, "map") && argc > 3) {

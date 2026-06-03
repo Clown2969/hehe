@@ -22,12 +22,15 @@ static int sb1_offset = 0;
 static int sb2_offset = 8;
 static int max_name_len = 32;
 static int max_file_sectors = 1;
+static int format = 0;
 
 module_param(disk_name, charp, 0444);
 module_param(sb1_offset, int, 0444);
 module_param(sb2_offset, int, 0444);
 module_param(max_name_len, int, 0444);
 module_param(max_file_sectors, int, 0444);
+module_param(format, int, 0444);
+MODULE_PARM_DESC(format, "Create a fresh filesystem instead of mounting an existing one");
 
 struct sfs_super_block_disk {
 	__le32 magic;
@@ -74,6 +77,7 @@ static ssize_t sfs_read(struct file *file, char __user *buf, size_t count, loff_
 	size_t total_size = (size_t)info->file_size_sectors * SFS_BLOCK_SIZE;
 	size_t read_bytes = 0;
 
+	if (idx >= info->n_files) return -EIO;
 	if (*ppos >= total_size) return 0;
 	if (count > total_size - *ppos) count = total_size - *ppos;
 
@@ -102,6 +106,7 @@ static ssize_t sfs_write(struct file *file, const char __user *buf, size_t count
 	size_t total_size = (size_t)info->file_size_sectors * SFS_BLOCK_SIZE;
 	size_t written = 0;
 
+	if (idx >= info->n_files) return -EIO;
 	if (*ppos >= total_size) return -ENOSPC;
 	if (count > total_size - *ppos) count = total_size - *ppos;
 
@@ -182,6 +187,7 @@ static long sfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (bh) { memset(bh->b_data, 0, SFS_BLOCK_SIZE); mark_buffer_dirty(bh); sync_dirty_buffer(bh); brelse(bh); }
 			bh = sb_bread(sb, info->backup_sb_sector);
 			if (bh) { memset(bh->b_data, 0, SFS_BLOCK_SIZE); mark_buffer_dirty(bh); sync_dirty_buffer(bh); brelse(bh); }
+			info->n_files = 0;
 		}
 		return 0;
 	case SFS_IOC_LIST_METADATA:
@@ -254,12 +260,101 @@ static struct dentry *sfs_lookup(struct inode *dir, struct dentry *dentry, unsig
 	return NULL;
 }
 static const struct inode_operations sfs_dir_inode_ops = { .lookup = sfs_lookup };
+
+static bool sfs_super_valid(struct sfs_super_block_disk *ds)
+{
+	return le32_to_cpu(ds->magic) == SFS_MAGIC &&
+	       ds->crc == cpu_to_le32(sfs_calc_crc(ds));
+}
+
+static void sfs_super_apply(struct sfs_fs_info *info, struct sfs_super_block_disk *ds)
+{
+	info->n_files = le32_to_cpu(ds->file_count);
+	info->file_size_sectors = le32_to_cpu(ds->sectors_per_file);
+}
+
+/* Create fresh superblocks (primary + backup) for a new filesystem. */
+static int sfs_create_super(struct super_block *sb, struct sfs_fs_info *info)
+{
+	struct buffer_head *bh, *bh2;
+	struct sfs_super_block_disk *ds;
+	sector_t total = bdev_nr_sectors(sb->s_bdev);
+
+	if (total <= 2) return -ENOSPC;
+
+	info->n_files = (u32)div_u64(total - 2, info->file_size_sectors);
+
+	bh = sb_bread(sb, info->main_sb_sector);
+	if (!bh) return -EIO;
+	ds = (struct sfs_super_block_disk *)bh->b_data;
+	memset(ds, 0, SFS_BLOCK_SIZE);
+	ds->magic = cpu_to_le32(SFS_MAGIC);
+	ds->file_count = cpu_to_le32(info->n_files);
+	ds->sectors_per_file = cpu_to_le32(info->file_size_sectors);
+	ds->sb2_sector = cpu_to_le32(info->backup_sb_sector);
+	ds->crc = cpu_to_le32(sfs_calc_crc(ds));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+
+	bh2 = sb_bread(sb, info->backup_sb_sector);
+	if (!bh2) { brelse(bh); return -EIO; }
+	memcpy(bh2->b_data, ds, SFS_BLOCK_SIZE);
+	mark_buffer_dirty(bh2);
+	sync_dirty_buffer(bh2);
+	brelse(bh2);
+	brelse(bh);
+	return 0;
+}
+
+/*
+ * Load an existing filesystem. Validate the primary superblock; if it is
+ * corrupted, fall back to the backup copy and repair the primary from it.
+ * If both copies are invalid, fail instead of silently recreating the fs.
+ */
+static int sfs_load_super(struct super_block *sb, struct sfs_fs_info *info, int silent)
+{
+	struct buffer_head *bh, *bh2;
+	struct sfs_super_block_disk *ds, *ds2;
+
+	bh = sb_bread(sb, info->main_sb_sector);
+	if (!bh) return -EIO;
+	ds = (struct sfs_super_block_disk *)bh->b_data;
+
+	if (sfs_super_valid(ds)) {
+		sfs_super_apply(info, ds);
+		brelse(bh);
+		return 0;
+	}
+
+	if (!silent)
+		pr_warn("simplefs: primary superblock invalid, trying backup\n");
+
+	bh2 = sb_bread(sb, info->backup_sb_sector);
+	if (!bh2) { brelse(bh); return -EIO; }
+	ds2 = (struct sfs_super_block_disk *)bh2->b_data;
+
+	if (!sfs_super_valid(ds2)) {
+		pr_err("simplefs: both superblocks are invalid\n");
+		brelse(bh2);
+		brelse(bh);
+		return -EINVAL;
+	}
+
+	sfs_super_apply(info, ds2);
+	/* repair the primary superblock from the valid backup */
+	memcpy(ds, ds2, SFS_BLOCK_SIZE);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh2);
+	brelse(bh);
+	return 0;
+}
+
 static int sfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	struct buffer_head *bh;
-	struct sfs_super_block_disk *ds;
 	struct sfs_fs_info *info;
-	int ret;
+	struct inode *root;
+	int err;
 
 	if (!sb_set_blocksize(sb, SFS_BLOCK_SIZE)) return -EINVAL;
 
@@ -271,38 +366,24 @@ static int sfs_fill_super(struct super_block *sb, void *data, int silent)
 	info->backup_sb_sector = sb2_offset;
 	info->file_size_sectors = max_t(u32, max_file_sectors, 1);
 
-	bh = sb_bread(sb, info->main_sb_sector);
-	if (!bh) { kfree(info); return -EIO; }
-	ds = (struct sfs_super_block_disk *)bh->b_data;
-
-	if (le32_to_cpu(ds->magic) != SFS_MAGIC || ds->crc != cpu_to_le32(sfs_calc_crc(ds))) {
-		info->n_files = (u32)div_u64(bdev_nr_sectors(sb->s_bdev) - 2, info->file_size_sectors);
-		ds->magic = cpu_to_le32(SFS_MAGIC);
-		ds->file_count = cpu_to_le32(info->n_files);
-		ds->sectors_per_file = cpu_to_le32(info->file_size_sectors);
-		ds->sb2_sector = cpu_to_le32(info->backup_sb_sector);
-		ds->crc = cpu_to_le32(sfs_calc_crc(ds));
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
-		struct buffer_head *bh2 = sb_bread(sb, info->backup_sb_sector);
-		if (bh2) {
-			memcpy(bh2->b_data, ds, SFS_BLOCK_SIZE);
-			mark_buffer_dirty(bh2);
-			sync_dirty_buffer(bh2);
-			brelse(bh2);
-		}
-	} else {
-		info->n_files = le32_to_cpu(ds->file_count);
-		info->file_size_sectors = le32_to_cpu(ds->sectors_per_file);
-	}
-	brelse(bh);
+	if (format)
+		err = sfs_create_super(sb, info);
+	else
+		err = sfs_load_super(sb, info, silent);
+	if (err) goto fail;
 
 	sb->s_magic = SFS_MAGIC;
-	struct inode *root = sfs_get_inode(sb, SFS_ROOT_INO);
-	if (!root) { kfree(info); return -ENOMEM; }
+	root = sfs_get_inode(sb, SFS_ROOT_INO);
+	if (!root) { err = -ENOMEM; goto fail; }
 	root->i_op = &sfs_dir_inode_ops;
 	sb->s_root = d_make_root(root);
-	return sb->s_root ? 0 : -ENOMEM;
+	if (!sb->s_root) { err = -ENOMEM; goto fail; }
+	return 0;
+
+fail:
+	kfree(info);
+	sb->s_fs_info = NULL;
+	return err;
 }
 
 static struct dentry *sfs_mount(struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
